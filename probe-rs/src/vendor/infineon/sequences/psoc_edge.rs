@@ -609,15 +609,18 @@ impl PsocEdge {
         // Write C_DEBUGEN to DHCSR via the CM55 AP and verify it sticks.
         // DHCSR is in the CoreSight PPB space and is safe to access
         // even when CM55 is not running — unlike peripheral registers like MxCm55Ctl.
-        // C_HALT is set alongside C_DEBUGEN so that attaching halts the core (proper
-        // debugger-attach semantics): if firmware has already released the CM55 it is
-        // stopped for the debugger, and a subsequent attach will not resume it.
+        //
+        // Only enable debug here; do NOT force C_HALT. Forcing a halt on every attach
+        // stops the running firmware and leaves non-halting profilers (e.g. `profile
+        // flat pcsr`, which reads DWT_PCSR while the core runs) sampling a halted core
+        // (PCSR reads 0xFFFFFFFF). Callers that need the core halted (gdb attach, the
+        // callstack profiler) request the halt explicitly through the normal core API,
+        // which also resumes it afterwards.
         {
             let mut cm55_ap = interface.memory_interface(&self.cm55_ap)?;
             let mut dhcsr = Dhcsr(0);
             dhcsr.enable_write();
             dhcsr.set_c_debugen(true);
-            dhcsr.set_c_halt(true);
             cm55_ap.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
 
             // Verify the write was accepted by polling DHCSR.C_DEBUGEN.
