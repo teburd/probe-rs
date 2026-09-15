@@ -99,6 +99,11 @@ pub(super) fn flat_profile(
         FlatProfileMethod::Pcsr => {
             enable_tracing(&mut session.core(core)?)?;
 
+            // DWT_PCSR only reports a real PC while the core is running; on a halted
+            // core it reads 0xFFFFFFFF. The session halts all cores on attach, so
+            // resume the profiled core before sampling.
+            session.core(core)?.run()?;
+
             let components = session.get_arm_components(DpAddress::Default)?;
             let component = find_component(&components, PeripheralType::Dwt)?;
             let interface = session.get_arm_interface()?;
