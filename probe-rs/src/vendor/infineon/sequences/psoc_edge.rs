@@ -674,7 +674,19 @@ impl PsocEdge {
             }
         };
         if wait_read_faulted {
-            Self::recover_dp(interface, self.cm33_ap.dp());
+            // The secure MxCm55Ctl read faulting (firmware locked the APPSS space) can
+            // wedge the DP hard enough that a bare ABORT write no longer ACKs, which
+            // would break every access after this. A full debug-port reconnect (line
+            // reset + power-up) clears it; the just-written CM55 C_DEBUGEN is core
+            // state and survives the reconnect. Fall back to the lighter sticky-flag
+            // clear only if the reconnect itself is unavailable.
+            if let Err(e) = interface.reinitialize() {
+                tracing::debug!(
+                    "DP reinitialize after CM55 wait-state fault failed: {:?}",
+                    e
+                );
+                Self::recover_dp(interface, self.cm33_ap.dp());
+            }
         }
         if cpu_wait {
             tracing::debug!("CM55 held in CPU_WAIT; releasing and pre-initializing");
