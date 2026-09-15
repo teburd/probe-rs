@@ -3,13 +3,14 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use std::time::Duration;
 
 use bitfield::bitfield;
 use probe_rs_target::{Chip, CoreType};
 
 use crate::{
     architecture::arm::{
-        ApV2Address, ArmDebugInterface, ArmError, FullyQualifiedApAddress,
+        ApV2Address, ArmDebugInterface, ArmError, DebugPortWire, FullyQualifiedApAddress, Pins,
         armv8m::Dhcsr,
         core::cortex_m,
         dp::{Abort, DpAddress, DpRegister},
@@ -161,6 +162,12 @@ pub struct PsocEdge {
     cm55_demcr_saved: AtomicU32,
     cm33_demcr_valid: AtomicBool,
     cm55_demcr_valid: AtomicBool,
+
+    // Set when attaching under reset (reset_hardware_assert ran). Test Mode
+    // acquisition only makes sense under reset (to catch the boot ROM Listen
+    // Window); on a free-running device the SYS AP is locked and writing TST_MODE
+    // wedges the part, so we skip it unless this is set.
+    under_reset: AtomicBool,
 }
 
 impl PsocEdge {
@@ -182,11 +189,27 @@ impl PsocEdge {
             cm55_demcr_saved: AtomicU32::new(0),
             cm33_demcr_valid: AtomicBool::new(false),
             cm55_demcr_valid: AtomicBool::new(false),
+            under_reset: AtomicBool::new(false),
         })
     }
 }
 
 impl ArmDebugSequence for PsocEdge {
+    fn reset_hardware_assert(&self, interface: &mut dyn DebugPortWire) -> Result<(), ArmError> {
+        // Record that this attach asserted reset. `debug_device_unlock` uses this to
+        // decide whether Test Mode acquisition is safe: it only is under reset, where
+        // the boot ROM is still in its Listen Window. This hook only runs on the
+        // under-reset attach path, so a normal (running-target) attach leaves the flag
+        // clear and skips the destructive SYS AP TST_MODE write.
+        self.under_reset.store(true, Ordering::Relaxed);
+
+        // Same behavior as the default implementation: drive nRESET asserted.
+        let mut n_reset = Pins(0);
+        n_reset.set_nreset(true);
+        let _ = interface.swj_pins(Pins(0), n_reset, Duration::ZERO)?;
+        Ok(())
+    }
+
     fn on_attach(
         &self,
         interface: &mut dyn ArmDebugInterface,
@@ -244,16 +267,37 @@ impl ArmDebugSequence for PsocEdge {
         default_ap: &FullyQualifiedApAddress,
         _permissions: &crate::Permissions,
     ) -> Result<(), ArmError> {
+        // Test Mode acquisition writes the boot ROM TST_MODE register through the
+        // SYS AP. That only helps when attaching under reset, where the boot ROM is
+        // still in its Listen Window. On a free-running device the SYS AP is locked:
+        // the access faults and, worse, can wedge the part so hard that it needs a
+        // power cycle. Only attempt it when we asserted reset for this attach.
+        if !self.under_reset.load(Ordering::Relaxed) {
+            tracing::debug!(
+                "PSoC Edge: not attaching under reset, skipping Test Mode acquisition"
+            );
+            return Ok(());
+        }
         // Best-effort Test Mode acquisition: request that the boot ROM remain in its
         // Listen Window and wait until it reports idle. This lets the debugger attach
         // before user firmware runs. Failures here are non-fatal — a device already
         // running firmware simply will not reach the idle state — so any hardware
-        // error is logged, the DP sticky flags are cleared, and attach proceeds.
+        // error is logged and attach proceeds.
         let dp = default_ap.dp();
         let sys_ap = Self::sys_ap(dp);
         if let Err(e) = self.acquire_test_mode(interface, &sys_ap) {
             tracing::debug!("PSoC Edge: Test Mode acquisition skipped: {:?}", e);
-            Self::recover_dp(interface, dp);
+            // A faulting SYS AP access can leave the DP wedged so hard that even an
+            // ABORT write no longer ACKs. Do a full debug-port reconnect (line reset
+            // + power-up) so attach can still proceed; fall back to the lighter
+            // sticky-flag clear if reconnect is unavailable.
+            if let Err(re) = interface.reinitialize() {
+                tracing::debug!(
+                    "PSoC Edge: DP reinitialize after test-mode fault failed: {:?}",
+                    re
+                );
+                Self::recover_dp(interface, dp);
+            }
         }
         Ok(())
     }
