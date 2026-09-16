@@ -15,6 +15,8 @@ pub(crate) enum FramePointerStackWalkError {
     ReadRegister(#[source] probe_rs::Error),
     #[error("Could not read frame record memory")]
     ReadMemory(#[source] probe_rs::Error),
+    #[error("Could not unwind the return address")]
+    UnwindReturnAddress,
     #[error("Failed to spill registers")]
     RegisterSpillError(#[source] probe_rs::Error),
 }
@@ -114,44 +116,44 @@ impl AdjustedFrameRecord {
         fr_32: FrameRecord32,
         instruction_set: InstructionSet,
         last_pc: u64,
-    ) -> Self {
+    ) -> Result<Self, FramePointerStackWalkError> {
         let ra = RegisterValue::U32(fr_32.return_address);
 
         let adjusted_return_address = if ra.is_zero() || ra.is_max_value() {
             ra
         } else {
             unwind_program_counter_register(ra, last_pc, Some(instruction_set))
-                .expect("Valid return address unwound")
+                .ok_or(FramePointerStackWalkError::UnwindReturnAddress)?
         };
 
-        Self {
+        Ok(Self {
             frame_pointer: fr_32.frame_pointer as u64,
             adjusted_return_address: adjusted_return_address
                 .try_into()
-                .expect("Should be able to convert 32-bit return address to u64"),
-        }
+                .map_err(|_| FramePointerStackWalkError::UnwindReturnAddress)?,
+        })
     }
 
     fn new_from_frame_record_64(
         fr_64: FrameRecord64,
         instruction_set: InstructionSet,
         last_pc: u64,
-    ) -> Self {
+    ) -> Result<Self, FramePointerStackWalkError> {
         let ra = RegisterValue::U64(fr_64.return_address);
 
         let adjusted_return_address = if ra.is_zero() || ra.is_max_value() {
             ra
         } else {
             unwind_program_counter_register(ra, last_pc, Some(instruction_set))
-                .expect("Valid return address unwound")
+                .ok_or(FramePointerStackWalkError::UnwindReturnAddress)?
         };
 
-        Self {
+        Ok(Self {
             frame_pointer: fr_64.frame_pointer,
             adjusted_return_address: adjusted_return_address
                 .try_into()
-                .expect("Should be able to convert 64-bit return address to u64"),
-        }
+                .map_err(|_| FramePointerStackWalkError::UnwindReturnAddress)?,
+        })
     }
 }
 
@@ -169,29 +171,33 @@ fn read_frame_record_for_core(
 
     match instruction_set {
         InstructionSet::A32 | InstructionSet::Thumb2 => {
-            read_arm_riscv_32_frame_record(memory, frame_pointer, ARM32_FRAME_RECORD_OFFSET).map(
-                |fr| AdjustedFrameRecord::new_from_frame_record_32(fr, instruction_set, last_pc),
-            )
+            read_arm_riscv_32_frame_record(memory, frame_pointer, ARM32_FRAME_RECORD_OFFSET)
+                .and_then(|fr| {
+                    AdjustedFrameRecord::new_from_frame_record_32(fr, instruction_set, last_pc)
+                })
         }
         InstructionSet::A64 => {
-            read_arm_riscv_64_frame_record(memory, frame_pointer, ARM64_FRAME_RECORD_OFFSET).map(
-                |fr| AdjustedFrameRecord::new_from_frame_record_64(fr, instruction_set, last_pc),
-            )
+            read_arm_riscv_64_frame_record(memory, frame_pointer, ARM64_FRAME_RECORD_OFFSET)
+                .and_then(|fr| {
+                    AdjustedFrameRecord::new_from_frame_record_64(fr, instruction_set, last_pc)
+                })
         }
         InstructionSet::RV32 | InstructionSet::RV32C => {
-            read_arm_riscv_32_frame_record(memory, frame_pointer, RISCV32_FRAME_RECORD_OFFSET).map(
-                |fr| AdjustedFrameRecord::new_from_frame_record_32(fr, instruction_set, last_pc),
-            )
+            read_arm_riscv_32_frame_record(memory, frame_pointer, RISCV32_FRAME_RECORD_OFFSET)
+                .and_then(|fr| {
+                    AdjustedFrameRecord::new_from_frame_record_32(fr, instruction_set, last_pc)
+                })
         }
         InstructionSet::RV64 | InstructionSet::RV64C => {
-            read_arm_riscv_64_frame_record(memory, frame_pointer, RISCV64_FRAME_RECORD_OFFSET).map(
-                |fr| AdjustedFrameRecord::new_from_frame_record_64(fr, instruction_set, last_pc),
-            )
+            read_arm_riscv_64_frame_record(memory, frame_pointer, RISCV64_FRAME_RECORD_OFFSET)
+                .and_then(|fr| {
+                    AdjustedFrameRecord::new_from_frame_record_64(fr, instruction_set, last_pc)
+                })
         }
         InstructionSet::Xtensa => {
-            read_xtensa_frame_record(memory, frame_pointer, XTENSA_FRAME_RECORD_OFFSET).map(|fr| {
-                AdjustedFrameRecord::new_from_frame_record_32(fr, instruction_set, last_pc)
-            })
+            read_xtensa_frame_record(memory, frame_pointer, XTENSA_FRAME_RECORD_OFFSET).and_then(
+                |fr| AdjustedFrameRecord::new_from_frame_record_32(fr, instruction_set, last_pc),
+            )
         }
     }
 }
@@ -224,16 +230,24 @@ fn frame_pointer_stack_walk_memory_interface(
     //   "The end of the frame record chain is indicated by the address zero appearing as the next
     //   link in the chain." - https://github.com/riscv-non-isa/riscv-elf-psabi-doc/releases
     while frame_pointer != 0 {
-        let adjusted_return_address;
-        AdjustedFrameRecord {
-            frame_pointer,
-            adjusted_return_address,
-        } = read_frame_record_for_core(
+        // A frame record we cannot read or unwind ends the walk. Return the frames
+        // gathered so far (at least the sampled PC) instead of discarding the whole
+        // sample: a broken chain — common when a sample lands in an exception frame
+        // or a leaf function without a frame record — should shorten the stack, not
+        // abort profiling.
+        let Ok(record) = read_frame_record_for_core(
             memory,
             instruction_set,
             frame_pointer,
             last_program_counter,
-        )?;
+        ) else {
+            break;
+        };
+        let adjusted_return_address;
+        AdjustedFrameRecord {
+            frame_pointer,
+            adjusted_return_address,
+        } = record;
 
         // Stack grows down, so frame pointer should be increasing when walking up callstack
         // Stop if the frame pointer has not increased
