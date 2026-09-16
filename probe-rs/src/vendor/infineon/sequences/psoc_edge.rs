@@ -270,7 +270,7 @@ impl ArmDebugSequence for PsocEdge {
                     Err(e) => {
                         // Interface no longer responding — fall back to a full re-enable.
                         tracing::debug!("CM55 re-attach halt check failed: {:?}", e);
-                        Self::recover_dp(interface, dp);
+                        Self::recover_dp_or_reconnect(interface, dp);
                         self.cm55_enabled.store(false, Ordering::Relaxed);
                     }
                 }
@@ -286,10 +286,13 @@ impl ArmDebugSequence for PsocEdge {
                 }
                 Err(e) => {
                     // Non-CoreDisabled failure while enabling the CM55 (e.g. firmware has
-                    // locked the secure APPSS space): recover the DP and report the core as
-                    // disabled so the caller/GDB stub can treat it as not-yet-debuggable.
+                    // locked the secure APPSS space, or the CM55 power domain is unclocked
+                    // while the device sleeps): the faulted access can leave the DP so
+                    // wedged that not even an ABORT write is acknowledged. Reconnect the
+                    // debug port and report the core as disabled so the caller/GDB stub
+                    // can treat it as not-yet-debuggable.
                     tracing::debug!("CM55 enable failed during attach: {:?}", e);
-                    Self::recover_dp(interface, dp);
+                    Self::recover_dp_or_reconnect(interface, dp);
                     return Err(ArmError::CoreDisabled);
                 }
             }
@@ -870,6 +873,19 @@ impl PsocEdge {
         cortex_m::write_core_reg(&mut *cm55_ap, crate::RegisterId(REGSEL_SP), CM55_SAFE_SP)?;
         cortex_m::write_core_reg(&mut *cm55_ap, crate::RegisterId(REGSEL_MSP), CM55_SAFE_SP)?;
         Ok(())
+    }
+
+    /// Recover the debug port after a faulted access wedged it.
+    ///
+    /// A faulting access into a locked or unclocked region can leave the DP so
+    /// wedged that a bare ABORT write is not acknowledged. Do a full debug-port
+    /// reconnect (line reset + power-up) and fall back to the lighter
+    /// sticky-flag clear only when the reconnect is unavailable.
+    fn recover_dp_or_reconnect(interface: &mut dyn ArmDebugInterface, dp: DpAddress) {
+        if let Err(e) = interface.reinitialize() {
+            tracing::debug!("DP reinitialize failed: {:?}", e);
+            Self::recover_dp(interface, dp);
+        }
     }
 
     /// Clear all DP sticky error flags via the ABORT register.
