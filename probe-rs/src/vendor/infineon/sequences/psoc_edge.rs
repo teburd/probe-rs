@@ -21,6 +21,7 @@ use crate::{
     },
     config::CoreExt,
     core::memory_mapped_registers::MemoryMappedRegister,
+    probe::BitSequence,
 };
 
 bitfield! {
@@ -195,6 +196,42 @@ impl PsocEdge {
 }
 
 impl ArmDebugSequence for PsocEdge {
+    fn debug_port_setup(
+        &self,
+        interface: &mut dyn DebugPortWire,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        // The PSOC Edge SW-DP is an SWD-only DPv3 that powers up in the dormant
+        // state. It does not react to the legacy JTAG-to-SWD switch sequence the
+        // default setup sends first, and the default's dormant fallback only runs
+        // after two one-second connect timeouts, which is longer than the attach
+        // budget of some frontends. Wake the DP with the dormant-to-SWD selection
+        // sequence directly, like the vendor OpenOCD does.
+        let mut result = Ok(());
+        for attempt in 1..=3 {
+            // Dormant-to-SWD selection (ARM ADI v6 §B5.3):
+            // line reset, JTAG-to-dormant, 8 high cycles, 128-bit selection
+            // alert, then 4 low cycles plus the SWD activation code.
+            interface.swj_sequence(&BitSequence::from_u64(51, 0x0007_FFFF_FFFF_FFFF))?;
+            interface.swj_sequence(&BitSequence::from_u64(31, 0x33BB_BBBA))?;
+            interface.swj_sequence(&BitSequence::from_u64(8, 0xFF))?;
+            interface.swj_sequence(&BitSequence::from_u64(64, 0x8685_2D95_6209_F392))?;
+            interface.swj_sequence(&BitSequence::from_u64(64, 0x19BC_0EA2_E3DD_AFE9))?;
+            interface.swj_sequence(&BitSequence::from_u64(12, 0x1A0))?;
+
+            // debug_port_connect performs the line reset and DPIDR read that
+            // complete the activation.
+            result = self.debug_port_connect(interface, dp);
+            match &result {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::debug!("PSoC Edge: dormant connect attempt {attempt} failed: {e}")
+                }
+            }
+        }
+        result
+    }
+
     fn reset_hardware_assert(&self, interface: &mut dyn DebugPortWire) -> Result<(), ArmError> {
         // Record that this attach asserted reset. `debug_device_unlock` uses this to
         // decide whether Test Mode acquisition is safe: it only is under reset, where
