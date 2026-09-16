@@ -16,7 +16,7 @@ use crate::{
         dp::{Abort, DpAddress, DpRegister},
         memory::ArmMemoryInterface,
         sequences::{
-            ArmDebugSequence, DefaultArmSequence, cortex_m_reset_system, cortex_m_wait_for_reset,
+            ArmDebugSequence, DefaultArmSequence, cortex_m_wait_for_reset,
         },
     },
     config::CoreExt,
@@ -144,6 +144,9 @@ const TIMEOUT_BOOT_COMPLETE_MS: u64 = 5000;
 
 /// Settle time after a reset before further debug access (DFP `__Reset_Finish_Delay`).
 const RESET_FINISH_DELAY_MS: u64 = 50;
+
+/// Maximum time to wait for the debug port to come back after a system reset.
+const TIMEOUT_RESET_RECOVER_MS: u64 = 3000;
 
 /// PSOC Edge debug sequences.
 #[derive(Debug)]
@@ -384,7 +387,7 @@ impl ArmDebugSequence for PsocEdge {
                         err
                     ),
                 }
-                cortex_m_reset_system(interface)?;
+                self.reset_system_and_reconnect(interface)?;
             }
 
             // Re-enable CM55 debug AP access (local reset and system reset both clear AppCpussApCtl).
@@ -418,7 +421,7 @@ impl ArmDebugSequence for PsocEdge {
         // CM33 (system) reset path: issue AIRCR.SYSRESETREQ, then re-enable CM55
         // debug access if it was active before the reset.
         tracing::debug!("PSoC Edge: system reset via AIRCR.SYSRESETREQ");
-        cortex_m_reset_system(interface)?;
+        self.reset_system_and_reconnect(interface)?;
 
         // Give secure boot time to re-run before touching CM55 debug registers.
         std::thread::sleep(std::time::Duration::from_millis(RESET_FINISH_DELAY_MS));
@@ -873,6 +876,54 @@ impl PsocEdge {
         cortex_m::write_core_reg(&mut *cm55_ap, crate::RegisterId(REGSEL_SP), CM55_SAFE_SP)?;
         cortex_m::write_core_reg(&mut *cm55_ap, crate::RegisterId(REGSEL_MSP), CM55_SAFE_SP)?;
         Ok(())
+    }
+
+    /// Issue AIRCR.SYSRESETREQ and wait for the debug port to come back.
+    ///
+    /// A PSOC Edge system reset takes the debug interface down while the boot ROM
+    /// secures the system, so both the SYSRESETREQ write and the DHCSR polls
+    /// afterwards can fail with transport errors of various shapes. Treat the
+    /// write error as expected, then reconnect the debug port and poll DHCSR
+    /// until it reads clean again or the recovery timeout elapses.
+    fn reset_system_and_reconnect(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+    ) -> Result<(), ArmError> {
+        use crate::architecture::arm::core::armv7m::Aircr;
+
+        let mut aircr = Aircr(0);
+        aircr.vectkey();
+        aircr.set_sysresetreq(true);
+        if let Err(e) = interface.write_word_32(Aircr::get_mmio_address(), aircr.into()) {
+            tracing::debug!(
+                "PSoC Edge: SYSRESETREQ write reported {:?} (expected when the reset drops the link)",
+                e
+            );
+        }
+
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(TIMEOUT_RESET_RECOVER_MS);
+        loop {
+            match interface.read_word_32(Dhcsr::get_mmio_address()) {
+                // S_RESET_ST is sticky and clears on read: a read with the bit
+                // clear means the reset has completed and no new one started.
+                Ok(val) if !Dhcsr(val).s_reset_st() => return Ok(()),
+                Ok(_) => {}
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    // The debug port may still be down; try to bring it back.
+                    if let Ok(probe) = interface.get_arm_debug_interface() {
+                        let _ = probe.reinitialize();
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ArmError::Timeout);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Recover the debug port after a faulted access wedged it.
