@@ -348,9 +348,21 @@ impl Session {
                     if !session.cores[core_id].is_arm_core() {
                         continue;
                     }
-                    let mut core = session
-                        .core(core_id)
-                        .inspect_err(|e| tracing::error!("Unable to get core {core_id}: {e}"))?;
+                    let mut core = match session.core(core_id) {
+                        Ok(core) => core,
+                        // A core the target reports as disabled is not running and has
+                        // no debug state to halt or clear a reset catch on. Secondary
+                        // cores that firmware has not released yet are in this state on
+                        // every under-reset attach, so skip them instead of failing.
+                        Err(crate::Error::CoreDisabled(_)) => {
+                            tracing::debug!("Core {core_id} is disabled, not waiting for halt");
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!("Unable to get core {core_id}: {e}");
+                            return Err(e);
+                        }
+                    };
 
                     core.wait_for_core_halted(Duration::from_millis(100))
                         .inspect_err(|e| {
