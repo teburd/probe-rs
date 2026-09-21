@@ -139,14 +139,28 @@ const EXT_BOOT_STATUS_ADDRESS: u32 = 0x3400_0000;
 /// Listen Window (i.e. the device is acquired in Test Mode).
 const EXT_BOOT_STATUS_IDLE: u32 = 0xAA00_B5F8;
 
-/// Maximum time to wait for the boot ROM to reach its idle Listen Window.
-const TIMEOUT_BOOT_COMPLETE_MS: u64 = 5000;
+/// Maximum time to wait for the boot ROM to reach its idle Listen Window after
+/// `TST_MODE.TEST_MODE` was requested. A device that was acquired reports idle within
+/// a few milliseconds; a longer wait only delays the next acquisition attempt.
+const TIMEOUT_BOOT_COMPLETE_MS: u64 = 1000;
 
 /// Settle time after a reset before further debug access (DFP `__Reset_Finish_Delay`).
 const RESET_FINISH_DELAY_MS: u64 = 50;
 
 /// Maximum time to wait for the debug port to come back after a system reset.
 const TIMEOUT_RESET_RECOVER_MS: u64 = 3000;
+
+/// Width of the XRES pulse used to acquire the device.
+///
+/// The PSOC Edge SW-DP is held in reset while XRES is asserted, so the pin is only
+/// pulsed and the debug port is connected right afterwards, inside the boot ROM
+/// Listen Window.
+const XRES_PULSE_MS: u64 = 5;
+
+/// Number of XRES pulse + Test Mode acquisition attempts made during an under-reset
+/// attach. Firmware can close the Listen Window before the acquisition lands, and each
+/// pulse restarts the boot ROM to open a new one.
+const ACQUIRE_ATTEMPTS: usize = 4;
 
 /// PSOC Edge debug sequences.
 #[derive(Debug)]
@@ -243,10 +257,21 @@ impl ArmDebugSequence for PsocEdge {
         // clear and skips the destructive SYS AP TST_MODE write.
         self.under_reset.store(true, Ordering::Relaxed);
 
-        // Same behavior as the default implementation: drive nRESET asserted.
+        // PSOC Edge holds its SW-DP in reset for as long as XRES is asserted: no line
+        // reset is answered and DPIDR never becomes readable, so the generic
+        // "assert nRESET and keep it asserted while connecting" flow can never attach.
+        // The device is instead acquired the way the vendor tools do it: pulse XRES and
+        // connect immediately afterwards, while the boot ROM is still in its Listen
+        // Window, so that `debug_device_unlock` can set `TST_MODE.TEST_MODE` before
+        // user firmware is given control. XRES is therefore released here and not in
+        // `reset_hardware_deassert`.
         let mut n_reset = Pins(0);
         n_reset.set_nreset(true);
-        let _ = interface.swj_pins(Pins(0), n_reset, Duration::ZERO)?;
+
+        interface.swj_pins(Pins(0), n_reset, Duration::ZERO)?;
+        std::thread::sleep(Duration::from_millis(XRES_PULSE_MS));
+        interface.swj_pins(n_reset, n_reset, Duration::ZERO)?;
+
         Ok(())
     }
 
@@ -321,27 +346,59 @@ impl ArmDebugSequence for PsocEdge {
             );
             return Ok(());
         }
-        // Best-effort Test Mode acquisition: request that the boot ROM remain in its
-        // Listen Window and wait until it reports idle. This lets the debugger attach
-        // before user firmware runs. Failures here are non-fatal — a device already
-        // running firmware simply will not reach the idle state — so any hardware
-        // error is logged and attach proceeds.
+        // Firmware that locks the secure SYS AP or drops the debug link can close the
+        // Listen Window before the acquisition lands, so the XRES pulse and the
+        // TST_MODE write are retried as a unit: each pulse restarts the boot ROM and
+        // opens a fresh window. A faulting SYS AP access also leaves the DP wedged, so
+        // the port is reconnected between attempts.
         let dp = default_ap.dp();
         let sys_ap = Self::sys_ap(dp);
-        if let Err(e) = self.acquire_test_mode(interface, &sys_ap) {
-            tracing::debug!("PSoC Edge: Test Mode acquisition skipped: {:?}", e);
-            // A faulting SYS AP access can leave the DP wedged so hard that even an
-            // ABORT write no longer ACKs. Do a full debug-port reconnect (line reset
-            // + power-up) so attach can still proceed; fall back to the lighter
-            // sticky-flag clear if reconnect is unavailable.
-            if let Err(re) = interface.reinitialize() {
-                tracing::debug!(
-                    "PSoC Edge: DP reinitialize after test-mode fault failed: {:?}",
-                    re
-                );
+
+        for attempt in 1..=ACQUIRE_ATTEMPTS {
+            match self.acquire_test_mode(interface, &sys_ap) {
+                Ok(true) => {
+                    // XRES was already released by `reset_hardware_assert`, so the reset
+                    // catch the caller arms afterwards can never fire: the core is running
+                    // the boot ROM Listen Window by now. Halt it here instead, which is the
+                    // state the under-reset attach path expects once reset is deasserted.
+                    if let Err(e) = self.halt_cm33(interface) {
+                        tracing::debug!(
+                            "PSoC Edge: could not halt the CM33 after acquire: {:?}",
+                            e
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        "PSoC Edge: Listen Window missed on acquire attempt {attempt}"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!("PSoC Edge: acquire attempt {attempt} faulted: {:?}", e);
+                }
+            }
+
+            if attempt == ACQUIRE_ATTEMPTS {
+                break;
+            }
+
+            // Restart the boot ROM for another Listen Window, then bring the debug port
+            // back up: XRES holds the SW-DP in reset, and a faulted SYS AP access can
+            // wedge it hard enough that not even an ABORT write is acknowledged.
+            if let Err(e) = Self::pulse_xres(interface) {
+                tracing::debug!("PSoC Edge: could not pulse XRES for re-acquire: {:?}", e);
+                break;
+            }
+            if let Err(e) = interface.reinitialize() {
+                tracing::debug!("PSoC Edge: DP reinitialize before re-acquire failed: {:?}", e);
                 Self::recover_dp(interface, dp);
             }
         }
+
+        // Acquisition is best-effort: a device that keeps its firmware running simply
+        // stays un-acquired, and attach continues with whatever access is available.
+        tracing::debug!("PSoC Edge: continuing without Test Mode acquisition");
         Ok(())
     }
 
@@ -578,17 +635,33 @@ impl PsocEdge {
         interface.read_raw_ap_register(sys_ap, AP_DRW)
     }
 
+    /// Pulses XRES through an already-open debug interface.
+    ///
+    /// Restarts the boot ROM so a new Listen Window opens. The debug port is held in
+    /// reset while XRES is asserted, so callers must reconnect it afterwards.
+    fn pulse_xres(interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
+        let mut n_reset = Pins(0);
+        n_reset.set_nreset(true);
+        let n_reset = n_reset.0 as u32;
+
+        interface.swj_pins(0, n_reset, 0)?;
+        std::thread::sleep(Duration::from_millis(XRES_PULSE_MS));
+        interface.swj_pins(n_reset, n_reset, 0)?;
+
+        Ok(())
+    }
+
     /// Acquire the device in Test Mode via the SYS AP.
     ///
     /// Sets `TST_MODE.TEST_MODE` so the boot ROM stays in its Listen Window, then polls
-    /// the extended boot status until it reports idle or the boot-complete timeout
-    /// elapses. Returns `Ok(())` on success or timeout (non-fatal); returns an error
-    /// only on a debug transport fault, which the caller recovers from.
+    /// the extended boot status until it reports idle. Returns `Ok(true)` once the
+    /// device is acquired and `Ok(false)` if the Listen Window closed before that;
+    /// returns an error only on a debug transport fault, which the caller recovers from.
     fn acquire_test_mode(
         &self,
         interface: &mut dyn ArmDebugInterface,
         sys_ap: &FullyQualifiedApAddress,
-    ) -> Result<(), ArmError> {
+    ) -> Result<bool, ArmError> {
         // Configure the SYS AP for 32-bit secure word accesses before using TAR/DRW.
         interface.write_raw_ap_register(sys_ap, AP_CSW, SYS_AP_CSW_WORD)?;
 
@@ -601,15 +674,14 @@ impl PsocEdge {
             let status = Self::read_sys_ap32(interface, sys_ap, EXT_BOOT_STATUS_ADDRESS)?;
             if status == EXT_BOOT_STATUS_IDLE {
                 tracing::debug!("PSoC Edge: acquired in Test Mode (boot status idle)");
-                return Ok(());
+                return Ok(true);
             }
             if std::time::Instant::now() >= deadline {
                 tracing::debug!(
-                    "PSoC Edge: boot status did not reach idle (last=0x{:08X}); \
-                     continuing without Test Mode",
+                    "PSoC Edge: boot status did not reach idle (last=0x{:08X})",
                     status
                 );
-                return Ok(());
+                return Ok(false);
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
@@ -752,8 +824,30 @@ impl PsocEdge {
     ///
     /// Returns `Err(ArmError::CoreDisabled)` if the CM55 debug interface is no longer
     /// accessible, so the caller can fall back to a full re-enable.
-    fn ensure_cm55_halted(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
-        let mut cm55_ap = interface.memory_interface(&self.cm55_ap)?;
+    /// Enables debug on the CM33 and halts it.
+    ///
+    /// Used after Test Mode acquisition, where the core runs the boot ROM Listen
+    /// Window rather than being held in reset, so a reset catch cannot stop it.
+    fn halt_cm33(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
+        let mut cm33_ap = interface.memory_interface(&self.cm33_ap)?;
+
+        let mut halt = Dhcsr(0);
+        halt.enable_write();
+        halt.set_c_debugen(true);
+        halt.set_c_halt(true);
+        cm33_ap.write_word_32(Dhcsr::get_mmio_address(), halt.into())?;
+
+        for _ in 0..100 {
+            if Dhcsr(cm33_ap.read_word_32(Dhcsr::get_mmio_address())?).s_halt() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        Err(ArmError::Timeout)
+    }
+
+    fn ensure_cm55_halted(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {        let mut cm55_ap = interface.memory_interface(&self.cm55_ap)?;
 
         let dhcsr = Dhcsr(cm55_ap.read_word_32(Dhcsr::get_mmio_address())?);
         if !dhcsr.c_debugen() {
@@ -949,13 +1043,13 @@ impl PsocEdge {
         abort.set_wderrclr(true);
         abort.set_stkerrclr(true);
         abort.set_stkcmpclr(true);
-        // Attempt to clear sticky error flags
+        // Attempt to clear sticky error flags. Every caller treats this as best-effort
+        // and logs its own outcome, and the write legitimately goes unacknowledged
+        // while the link is still down after a system reset, so a failure here is not
+        // by itself a problem worth warning about.
         match interface.write_raw_dp_register(dp, Abort::ADDRESS, abort.0) {
             Ok(()) => tracing::debug!("Cleared DP sticky error flags"),
-            Err(e) => tracing::warn!(
-                "Failed to clear DP sticky error flags: {:?} (potential debug transport issue)",
-                e
-            ),
+            Err(e) => tracing::debug!("Failed to clear DP sticky error flags: {:?}", e),
         }
     }
 }
