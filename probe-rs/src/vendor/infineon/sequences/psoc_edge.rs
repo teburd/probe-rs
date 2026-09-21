@@ -438,7 +438,7 @@ impl ArmDebugSequence for PsocEdge {
                 );
                 let dp = self.cm33_ap.dp();
                 match interface.get_arm_debug_interface() {
-                    Ok(arm) => Self::recover_dp(arm, dp),
+                    Ok(arm) => Self::recover_dp_or_reconnect(arm, dp),
                     Err(err) => tracing::warn!(
                         "PSoC Edge: could not obtain ARM debug interface to recover DP: {:?}",
                         err
@@ -463,7 +463,7 @@ impl ArmDebugSequence for PsocEdge {
                 Err(e) => {
                     let dp = self.cm33_ap.dp();
                     match interface.get_arm_debug_interface() {
-                        Ok(arm) => Self::recover_dp(arm, dp),
+                        Ok(arm) => Self::recover_dp_or_reconnect(arm, dp),
                         Err(err) => tracing::warn!(
                             "PSoC Edge: could not obtain ARM debug interface to recover DP: {:?}",
                             err
@@ -503,11 +503,13 @@ impl ArmDebugSequence for PsocEdge {
                 }
                 Err(e) => {
                     // The re-enable may fault if secure boot has re-locked the CM55's
-                    // secure space; recover the DP and continue — the CM55 will be
-                    // re-enabled on the next on_attach once firmware releases it.
+                    // secure space. The link is usually down for good at this point, so
+                    // a bare ABORT write is not acknowledged: do a full reconnect so the
+                    // session stays usable for shutdown and for the next operation. The
+                    // CM55 is re-enabled on the next on_attach once firmware releases it.
                     let dp = self.cm33_ap.dp();
                     match interface.get_arm_debug_interface() {
-                        Ok(arm) => Self::recover_dp(arm, dp),
+                        Ok(arm) => Self::recover_dp_or_reconnect(arm, dp),
                         Err(err) => tracing::warn!(
                             "PSoC Edge: could not obtain ARM debug interface to recover DP: {:?}",
                             err
