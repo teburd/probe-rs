@@ -165,8 +165,11 @@ impl<T: DapAccess> ApAccess for T {
         R: ApRegister,
     {
         tracing::debug!("Writing AP register {}, value={:x?}", R::NAME, register);
+        // The error is returned to the caller, which decides whether it is a problem:
+        // sequences that deliberately drop the link (a SYSRESETREQ write, for example)
+        // expect it. Log at debug like read_ap_register does instead of warning twice.
         self.write_raw_ap_register(port.ap_address(), R::ADDRESS, register.into())
-            .inspect_err(|err| tracing::warn!("Failed to write AP register {}: {}", R::NAME, err))
+            .inspect_err(|err| tracing::debug!("Failed to write AP register {}: {}", R::NAME, err))
     }
 
     fn write_ap_register_repeated<PORT, R>(
